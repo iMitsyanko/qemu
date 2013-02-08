@@ -34,11 +34,11 @@
 #include "hw/sd.h"
 #include "qemu/bitmap.h"
 
-//#define DEBUG_SD 1
+#define DEBUG_SD 1
 
 #ifdef DEBUG_SD
 #define DPRINTF(fmt, ...) \
-do { fprintf(stderr, "SD: " fmt , ## __VA_ARGS__); } while (0)
+do { fprintf(stderr, "SD [%s -- %d]: " fmt , __func__, __LINE__, ## __VA_ARGS__); } while (0)
 #else
 #define DPRINTF(fmt, ...) do {} while(0)
 #endif
@@ -112,6 +112,9 @@ struct SDState {
     uint8_t *buf;
 
     bool enable;
+
+    QEMUIOVector qiov;
+    struct iovec iov;
 };
 
 static void sd_set_mode(SDState *sd)
@@ -1472,6 +1475,45 @@ static void sd_blk_read(SDState *sd, uint64_t addr, uint32_t len)
         memcpy(sd->data, sd->buf + (addr & 511), len);
 }
 
+static void sd_blk_read_completed_fn(void *opaque, int ret)
+{
+    SDState *sd = opaque;
+    int io_len;
+
+    DPRINTF("ret = %d\n", ret);
+
+    if (ret != 0) {
+        return;
+    }
+
+    io_len = (sd->ocr & (1 << 30)) ? 512 : sd->blk_len;
+    memcpy(sd->data, sd->buf, io_len);
+    sd->state = sd_transfer_state;
+}
+
+static void sd_blk_read_async(SDState *sd, uint64_t addr, uint32_t len)
+{
+    uint64_t end = addr + len;
+
+    DPRINTF("sd_blk_read: addr = 0x%08llx, len = %d\n",
+            (unsigned long long) addr, len);
+
+    assert(end <= ((addr & ~511) + 512));
+
+    if (!sd->bdrv) {
+        fprintf(stderr, "[%s -- %d]: no block device\n", __func__, __LINE__);
+        return;
+    }
+
+    sd->iov.iov_base = sd->buf;
+    sd->iov.iov_len = len;
+    qemu_iovec_init_external(&sd->qiov, &sd->iov, 1);
+
+    bdrv_aio_readv(sd->bdrv, addr >> 9, &sd->qiov, 1, sd_blk_read_completed_fn, sd);
+
+
+}
+
 static void sd_blk_write(SDState *sd, uint64_t addr, uint32_t len)
 {
     uint64_t end = addr + len;
@@ -1751,6 +1793,41 @@ uint8_t sd_read_data(SDState *sd)
     }
 
     return ret;
+}
+
+void sd_read_data_block_async(SDState *sd, uint8_t *buf, SDBlockReadCompleteFunc cb, void *opaque)
+{
+    uint32_t io_len;
+
+    if (!sd->bdrv || !bdrv_is_inserted(sd->bdrv) || !sd->enable) {
+        return;
+    }
+
+    if (sd->state != sd_sendingdata_state) {
+        fprintf(stderr, "%s: not in Sending-Data state\n", __func__);
+        return;
+    }
+
+    if (sd->card_status & (ADDRESS_ERROR | WP_VIOLATION)) {
+        return;
+    }
+
+    io_len = (sd->ocr & (1 << 30)) ? 512 : sd->blk_len;
+
+    switch (sd->current_cmd) {
+    case 17:    /* CMD17:  READ_SINGLE_BLOCK */
+        if (sd->data_offset != 0) {
+            fprintf(stderr, "[%s - %d]: reading block from unaligned address\n", __func__, __LINE__);
+            break;
+        }
+        sd_blk_read_async(sd, sd->data_start, io_len);
+        break;
+    case 18:    /* CMD18:  READ_MULTIPLE_BLOCK */
+        break;
+    default:
+        fprintf(stderr, "sd_read_data: unknown command\n");
+        break;
+    }
 }
 
 bool sd_data_ready(SDState *sd)
