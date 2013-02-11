@@ -65,10 +65,10 @@
 #define SDHC_CAPAB_30V            0ul        /* Voltage support 3.0v */
 #define SDHC_CAPAB_33V            1ul        /* Voltage support 3.3v */
 #define SDHC_CAPAB_SUSPRESUME     0ul        /* Suspend/resume support */
-#define SDHC_CAPAB_SDMA           1ul        /* SDMA support */
+#define SDHC_CAPAB_SDMA           0ul        /* SDMA support */
 #define SDHC_CAPAB_HIGHSPEED      1ul        /* High speed support */
-#define SDHC_CAPAB_ADMA1          1ul        /* ADMA1 support */
-#define SDHC_CAPAB_ADMA2          1ul        /* ADMA2 support */
+#define SDHC_CAPAB_ADMA1          0ul        /* ADMA1 support */
+#define SDHC_CAPAB_ADMA2          0ul        /* ADMA2 support */
 /* Maximum host controller R/W buffers size
  * Possible values: 512, 1024, 2048 bytes */
 #define SDHC_CAPAB_MAXBLOCKLENGTH 512ul
@@ -329,14 +329,17 @@ static void sdhci_block_read_complete_fn(void *opaque, unsigned bytes_read)
 /* Fill host controller's read buffer with BLKSIZE bytes of data from card */
 static void sdhci_read_block_from_card(SDHCIState *s)
 {
-    int index = 0;
-
     if ((s->trnmod & SDHC_TRNS_MULTI) &&
             (s->trnmod & SDHC_TRNS_BLK_CNT_EN) && (s->blkcnt == 0)) {
         return;
     }
 
-    sd_read_data_block_async(s->card, s->fifo_buffer, sdhci_block_read_complete_fn, s);
+    s->rw_vec.buf = s->fifo_buffer;
+    s->rw_vec.cb_fn = sdhci_block_read_complete_fn;
+    s->rw_vec.opaque = s;
+    s->rw_vec.direction = SD_VEC_READ_FROM_CARD;
+
+    sd_read_data_block_async(s->card, &s->rw_vec);
 }
 
 /* Read @size byte of data from host controller @s BUFFER DATA PORT register */
@@ -373,7 +376,8 @@ static uint32_t sdhci_read_dataport(SDHCIState *s, unsigned size)
                  !(s->prnsts & SDHC_DAT_LINE_ACTIVE))) {
                 SDHCI_GET_CLASS(s)->end_data_transfer(s);
             } else { /* if there are more data, read next block from card */
-                SDHCI_GET_CLASS(s)->read_block_from_card(s);
+/*                SDHCI_GET_CLASS(s)->read_block_from_card(s);*/
+                sd_read_data_block_async(s->card, NULL);
             }
             break;
         }

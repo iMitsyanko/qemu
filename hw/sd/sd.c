@@ -34,7 +34,7 @@
 #include "hw/sd.h"
 #include "qemu/bitmap.h"
 
-#define DEBUG_SD 1
+//#define DEBUG_SD 1
 
 #ifdef DEBUG_SD
 #define DPRINTF(fmt, ...) \
@@ -110,11 +110,13 @@ struct SDState {
     qemu_irq inserted_cb;
     BlockDriverState *bdrv;
     uint8_t *buf;
+    uint8_t *buf2;
 
     bool enable;
 
     QEMUIOVector qiov;
-    struct iovec iov;
+    struct iovec iov[2];
+    SDBlockRWVec *cur_rwvec;
 };
 
 static void sd_set_mode(SDState *sd)
@@ -482,6 +484,7 @@ static const VMStateDescription sd_vmstate = {
         VMSTATE_UINT32(data_offset, SDState),
         VMSTATE_UINT8_ARRAY(data, SDState, 512),
         VMSTATE_BUFFER_POINTER_UNSAFE(buf, SDState, 1, 512),
+        VMSTATE_BUFFER_UNSAFE(buf2, SDState, 1, 512),
         VMSTATE_BOOL(enable, SDState),
         VMSTATE_END_OF_LIST()
     }
@@ -497,6 +500,7 @@ SDState *sd_init(BlockDriverState *bs, bool is_spi)
 
     sd = (SDState *) g_malloc0(sizeof(SDState));
     sd->buf = qemu_blockalign(bs, 512);
+    sd->buf2 = qemu_blockalign(bs, 512);
     sd->spi = is_spi;
     sd->enable = true;
     sd_reset(sd, bs);
@@ -1456,8 +1460,7 @@ static void sd_blk_read(SDState *sd, uint64_t addr, uint32_t len)
 {
     uint64_t end = addr + len;
 
-    DPRINTF("sd_blk_read: addr = 0x%08llx, len = %d\n",
-            (unsigned long long) addr, len);
+    DPRINTF("addr = 0x%08llx, len = %d\n", (unsigned long long) addr, len);
     if (!sd->bdrv || bdrv_read(sd->bdrv, addr >> 9, sd->buf, 1) < 0) {
         fprintf(stderr, "sd_blk_read: read error on host side\n");
         return;
@@ -1473,45 +1476,6 @@ static void sd_blk_read(SDState *sd, uint64_t addr, uint32_t len)
         memcpy(sd->data + 512 - (addr & 511), sd->buf, end & 511);
     } else
         memcpy(sd->data, sd->buf + (addr & 511), len);
-}
-
-static void sd_blk_read_completed_fn(void *opaque, int ret)
-{
-    SDState *sd = opaque;
-    int io_len;
-
-    DPRINTF("ret = %d\n", ret);
-
-    if (ret != 0) {
-        return;
-    }
-
-    io_len = (sd->ocr & (1 << 30)) ? 512 : sd->blk_len;
-    memcpy(sd->data, sd->buf, io_len);
-    sd->state = sd_transfer_state;
-}
-
-static void sd_blk_read_async(SDState *sd, uint64_t addr, uint32_t len)
-{
-    uint64_t end = addr + len;
-
-    DPRINTF("sd_blk_read: addr = 0x%08llx, len = %d\n",
-            (unsigned long long) addr, len);
-
-    assert(end <= ((addr & ~511) + 512));
-
-    if (!sd->bdrv) {
-        fprintf(stderr, "[%s -- %d]: no block device\n", __func__, __LINE__);
-        return;
-    }
-
-    sd->iov.iov_base = sd->buf;
-    sd->iov.iov_len = len;
-    qemu_iovec_init_external(&sd->qiov, &sd->iov, 1);
-
-    bdrv_aio_readv(sd->bdrv, addr >> 9, &sd->qiov, 1, sd_blk_read_completed_fn, sd);
-
-
 }
 
 static void sd_blk_write(SDState *sd, uint64_t addr, uint32_t len)
@@ -1795,16 +1759,61 @@ uint8_t sd_read_data(SDState *sd)
     return ret;
 }
 
-void sd_read_data_block_async(SDState *sd, uint8_t *buf, SDBlockReadCompleteFunc cb, void *opaque)
+static void sd_blk_read_completed_fn(void *opaque, int ret)
+{
+    SDState *sd = opaque;
+    unsigned io_len, offset;
+    uint64_t end;
+
+    DPRINTF("ret = %d\n", ret);
+
+    if (ret != 0) {
+        return;
+    }
+
+    io_len = (sd->ocr & (1 << 30)) ? 512 : sd->blk_len;
+    end = sd->data_start + io_len;
+    offset = (sd->data_start & ~BDRV_SECTOR_MASK);
+
+    if (end > (sd->data_start & BDRV_SECTOR_MASK) + BDRV_SECTOR_SIZE) {
+        memcpy(sd->cur_rwvec->buf, sd->buf + offset, BDRV_SECTOR_SIZE - offset);
+        memcpy(sd->cur_rwvec->buf + BDRV_SECTOR_SIZE - offset, sd->buf2, end & ~BDRV_SECTOR_MASK);
+    } else {
+        memcpy(sd->cur_rwvec->buf, sd->buf + offset, io_len);
+    }
+
+    sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque, io_len);
+
+    switch (sd->current_cmd) {
+    case 17:    /* CMD17:  READ_SINGLE_BLOCK */
+        sd->state = sd_transfer_state;
+        sd->cur_rwvec = NULL;
+        break;
+    case 11:    /* CMD11:  READ_DAT_UNTIL_STOP */
+    case 18:    /* CMD18:  READ_MULTIPLE_BLOCK */
+        sd->data_start += io_len;
+        if (sd->data_start + io_len > sd->size) {
+            sd->card_status |= ADDRESS_ERROR;
+        }
+        break;
+    default:
+        fprintf(stderr, "sd_read_data: unknown command\n");
+        break;
+    }
+}
+
+void sd_read_data_block_async(SDState *sd, SDBlockRWVec *read_v)
 {
     uint32_t io_len;
+    uint64_t end;
+    unsigned nb_sectors = 0;
 
     if (!sd->bdrv || !bdrv_is_inserted(sd->bdrv) || !sd->enable) {
         return;
     }
 
     if (sd->state != sd_sendingdata_state) {
-        fprintf(stderr, "%s: not in Sending-Data state\n", __func__);
+        DPRINTF("not in Sending-Data state\n");
         return;
     }
 
@@ -1812,20 +1821,61 @@ void sd_read_data_block_async(SDState *sd, uint8_t *buf, SDBlockReadCompleteFunc
         return;
     }
 
+    if (read_v) {
+        sd->cur_rwvec = read_v;
+    }
+
+    assert(sd->data_offset == 0 && sd->cur_rwvec);
+
     io_len = (sd->ocr & (1 << 30)) ? 512 : sd->blk_len;
+    end = sd->data_start + io_len;
 
     switch (sd->current_cmd) {
-    case 17:    /* CMD17:  READ_SINGLE_BLOCK */
-        if (sd->data_offset != 0) {
-            fprintf(stderr, "[%s - %d]: reading block from unaligned address\n", __func__, __LINE__);
-            break;
-        }
-        sd_blk_read_async(sd, sd->data_start, io_len);
+    case 9: /* CMD9:   SEND_CSD */
+    case 10:    /* CMD10:  SEND_CID */
+        memcpy(sd->cur_rwvec->buf, sd->data, 16);
+        sd->state = sd_transfer_state;
+        sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque, 16);
         break;
+    case 13:    /* ACMD13: SD_STATUS */
+        memcpy(sd->cur_rwvec->buf, sd->sd_status, sizeof(sd->sd_status));
+        sd->state = sd_transfer_state;
+        sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque, sizeof(sd->sd_status));
+        break;
+    case 11:    /* CMD11:  READ_DAT_UNTIL_STOP */
+    case 17:    /* CMD17:  READ_SINGLE_BLOCK */
     case 18:    /* CMD18:  READ_MULTIPLE_BLOCK */
+        sd->iov[0].iov_base = sd->buf;
+        sd->iov[0].iov_len = BDRV_SECTOR_SIZE;
+        nb_sectors++;
+
+        if (end > (sd->data_start & BDRV_SECTOR_MASK) + BDRV_SECTOR_SIZE) {
+            sd->iov[1].iov_base = sd->buf2;
+            sd->iov[1].iov_len = BDRV_SECTOR_SIZE;
+            nb_sectors++;
+        }
+
+        qemu_iovec_init_external(&sd->qiov, &sd->iov[0], nb_sectors);
+        bdrv_aio_readv(sd->bdrv, sd->data_start >> BDRV_SECTOR_BITS, &sd->qiov, nb_sectors, sd_blk_read_completed_fn, sd);
+        break;
+    case 22:    /* ACMD22: SEND_NUM_WR_BLOCKS */
+    case 30:    /* CMD30:  SEND_WRITE_PROT */
+        memcpy(sd->cur_rwvec->buf, sd->data, 4);
+        sd->state = sd_transfer_state;
+        sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque, 4);
+        break;
+    case 51:    /* ACMD51: SEND_SCR */
+        memcpy(sd->cur_rwvec->buf, sd->scr, sizeof(sd->scr));
+        sd->state = sd_transfer_state;
+        sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque, sizeof(sd->scr));
+        break;
+    case 56:    /* CMD56:  GEN_CMD */
+        memset(sd->cur_rwvec->buf, 0xec, sd->blk_len);
+        sd->state = sd_transfer_state;
+        sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque, sizeof(sd->scr));
         break;
     default:
-        fprintf(stderr, "sd_read_data: unknown command\n");
+        DPRINTF("unknown command\n");
         break;
     }
 }

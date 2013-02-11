@@ -235,6 +235,7 @@ typedef struct SDHCIState {
     SysBusDevice busdev;
     SDState *card;
     MemoryRegion iomem;
+    SDBlockRWVec rw_vec;
 
     QEMUTimer *insert_timer;       /* timer for 'changing' sd card. */
     QEMUTimer *transfer_timer;
