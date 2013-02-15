@@ -337,7 +337,6 @@ static void sdhci_read_block_from_card(SDHCIState *s)
     s->rw_vec.buf = s->fifo_buffer;
     s->rw_vec.cb_fn = sdhci_block_read_complete_fn;
     s->rw_vec.opaque = s;
-    s->rw_vec.direction = SD_VEC_READ_FROM_CARD;
 
     sd_read_data_block_async(s->card, &s->rw_vec);
 }
@@ -376,7 +375,6 @@ static uint32_t sdhci_read_dataport(SDHCIState *s, unsigned size)
                  !(s->prnsts & SDHC_DAT_LINE_ACTIVE))) {
                 SDHCI_GET_CLASS(s)->end_data_transfer(s);
             } else { /* if there are more data, read next block from card */
-/*                SDHCI_GET_CLASS(s)->read_block_from_card(s);*/
                 sd_read_data_block_async(s->card, NULL);
             }
             break;
@@ -386,30 +384,11 @@ static uint32_t sdhci_read_dataport(SDHCIState *s, unsigned size)
     return value;
 }
 
-/* Write data from host controller FIFO to card */
-static void sdhci_write_block_to_card(SDHCIState *s)
+static void sdhci_block_write_complete_fn(void *opaque, unsigned bytes_read)
 {
-    int index = 0;
+    SDHCIState *s = opaque;
 
-    if (s->prnsts & SDHC_SPACE_AVAILABLE) {
-        if (s->norintstsen & SDHC_NISEN_WBUFRDY) {
-            s->norintsts |= SDHC_NIS_WBUFRDY;
-        }
-        sdhci_update_irq(s);
-        return;
-    }
-
-    if (s->trnmod & SDHC_TRNS_BLK_CNT_EN) {
-        if (s->blkcnt == 0) {
-            return;
-        } else {
-            s->blkcnt--;
-        }
-    }
-
-    for (index = 0; index < (s->blksize & 0x0fff); index++) {
-        sd_write_data(s->card, s->fifo_buffer[index]);
-    }
+    assert((s->blksize & 0x0fff) == bytes_read);
 
     /* Next data can be written through BUFFER DATORT register */
     s->prnsts |= SDHC_SPACE_AVAILABLE;
@@ -435,6 +414,32 @@ static void sdhci_write_block_to_card(SDHCIState *s)
     }
 
     sdhci_update_irq(s);
+}
+
+/* Write data from host controller FIFO to card */
+static void sdhci_write_block_to_card(SDHCIState *s)
+{
+    if (s->prnsts & SDHC_SPACE_AVAILABLE) {
+        if (s->norintstsen & SDHC_NISEN_WBUFRDY) {
+            s->norintsts |= SDHC_NIS_WBUFRDY;
+        }
+        sdhci_update_irq(s);
+        return;
+    }
+
+    if (s->trnmod & SDHC_TRNS_BLK_CNT_EN) {
+        if (s->blkcnt == 0) {
+            return;
+        } else {
+            s->blkcnt--;
+        }
+    }
+
+    s->rw_vec.buf = s->fifo_buffer;
+    s->rw_vec.cb_fn = sdhci_block_write_complete_fn;
+    s->rw_vec.opaque = s;
+
+    sd_write_data_block_async(s->card, &s->rw_vec);
 }
 
 /* Write @size bytes of @value data to host controller @s Buffer Data Port

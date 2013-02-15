@@ -66,11 +66,6 @@ typedef struct {
     uint8_t crc;
 } SDRequest;
 
-typedef enum {
-    SD_VEC_WRITE_TO_CARD,
-    SD_VEC_READ_FROM_CARD,
-} SDRWVecDirection;
-
 typedef void SDBlockReadCompleteFunc(void *opaque, unsigned bytes_read);
 typedef struct SDState SDState;
 
@@ -78,7 +73,6 @@ typedef struct SDBlockRWVec {
     SDBlockReadCompleteFunc *cb_fn;
     uint8_t *buf;
     void *opaque;
-    uint8_t direction;
 } SDBlockRWVec;
 
 SDState *sd_init(BlockDriverState *bs, bool is_spi);
@@ -87,6 +81,7 @@ int sd_do_command(SDState *sd, SDRequest *req,
 void sd_write_data(SDState *sd, uint8_t value);
 uint8_t sd_read_data(SDState *sd);
 void sd_read_data_block_async(SDState *sd, SDBlockRWVec *read_v);
+void sd_write_data_block_async(SDState *sd, SDBlockRWVec *read_v);
 void sd_set_cb(SDState *sd, qemu_irq readonly, qemu_irq insert);
 bool sd_data_ready(SDState *sd);
 void sd_enable(SDState *sd, bool enable);
