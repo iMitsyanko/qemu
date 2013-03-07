@@ -279,7 +279,7 @@ void memory_region_init_ram(MemoryRegion *mr,
  *
  * @mr: the #MemoryRegion to be initialized.
  * @name: the name of the region.
- * @size: size of the region.
+ * @size: size of the region. Must be a multiple of target page size.
  * @ptr: memory to be mapped; must contain at least @size bytes.
  */
 void memory_region_init_ram_ptr(MemoryRegion *mr,

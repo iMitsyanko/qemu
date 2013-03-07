@@ -949,6 +949,7 @@ void memory_region_init_ram_ptr(MemoryRegion *mr,
                                 uint64_t size,
                                 void *ptr)
 {
+    assert((size & (TARGET_PAGE_SIZE - 1)) == 0);
     memory_region_init(mr, name, size);
     mr->ram = true;
     mr->terminates = true;
