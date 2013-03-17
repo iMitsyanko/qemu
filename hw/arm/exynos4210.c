@@ -76,6 +76,11 @@
 /* EHCI */
 #define EXYNOS4210_EHCI_BASE_ADDR           0x12580000
 
+#define EXYNOS4210_SDHC0_BASE_ADDR          0x12510000
+#define EXYNOS4210_SDHC1_BASE_ADDR          0x12520000
+#define EXYNOS4210_SDHC2_BASE_ADDR          0x12530000
+#define EXYNOS4210_SDHC3_BASE_ADDR          0x12540000
+
 static uint8_t chipid_and_omr[] = { 0x11, 0x02, 0x21, 0x43,
                                     0x09, 0x00, 0x00, 0x00 };
 
@@ -317,6 +322,17 @@ Exynos4210State *exynos4210_init(MemoryRegion *system_mem,
         s->i2c_if[n] = (i2c_bus *)qdev_get_child_bus(dev, "i2c");
     }
 
+    sysbus_create_simple("generic-sdhci", EXYNOS4210_SDHC0_BASE_ADDR,
+            s->irq_table[exynos4210_get_irq(29, 0)]);
+
+    sysbus_create_simple("generic-sdhci", EXYNOS4210_SDHC1_BASE_ADDR,
+            s->irq_table[exynos4210_get_irq(29, 1)]);
+
+    sysbus_create_simple("generic-sdhci", EXYNOS4210_SDHC2_BASE_ADDR,
+            s->irq_table[exynos4210_get_irq(29, 2)]);
+
+    sysbus_create_simple("generic-sdhci", EXYNOS4210_SDHC3_BASE_ADDR,
+            s->irq_table[exynos4210_get_irq(29, 3)]);
 
     /*** UARTs ***/
     exynos4210_uart_create(EXYNOS4210_UART0_BASE_ADDR,
