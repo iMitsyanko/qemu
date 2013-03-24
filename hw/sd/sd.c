@@ -885,12 +885,14 @@ static sd_rsp_type_t sd_normal_command(SDState *sd,
         switch (sd->state) {
         case sd_sendingdata_state:
             sd->state = sd_transfer_state;
+            sd->cur_rwvec = NULL;
             return sd_r1b;
 
         case sd_receivingdata_state:
             sd->state = sd_programming_state;
             /* Bzzzzzzztt .... Operation complete.  */
             sd->state = sd_transfer_state;
+            sd->cur_rwvec = NULL;
             return sd_r1b;
 
         default:
@@ -1759,12 +1761,11 @@ uint8_t sd_read_data(SDState *sd)
     return ret;
 }
 
-static void sd_blk_read_completed_fn(void *opaque, int ret)
+static void sd_read_done_fn(void *opaque, int ret)
 {
     SDState *sd = opaque;
-    unsigned offset;
-    uint32_t io_len;
-    uint64_t end_addr;
+    uint32_t io_len, offset;
+    uint64_t end_sector;
 
     DPRINTF("ret = %d\n", ret);
 
@@ -1773,19 +1774,28 @@ static void sd_blk_read_completed_fn(void *opaque, int ret)
     }
 
     io_len = (sd->ocr & (1 << 30)) ? 512 : sd->blk_len;
-    end_addr = sd->data_start + io_len;
-    offset = (sd->data_start + sd->data_offset) & ~BDRV_SECTOR_MASK;
+    end_sector = (sd->data_start + io_len - 1) >> BDRV_SECTOR_BITS;
+    offset = (sd->data_start + sd->cur_rwvec->transferred) & ~BDRV_SECTOR_MASK;
 
-    if (end_addr > ((sd->data_start + sd->data_offset) & BDRV_SECTOR_MASK) + BDRV_SECTOR_SIZE) {
-        memcpy(sd->cur_rwvec->buf + sd->data_offset, sd->buf + offset, BDRV_SECTOR_SIZE - offset);
-        sd->data_offset += BDRV_SECTOR_SIZE - offset;
-        bdrv_aio_readv(sd->bdrv, (sd->data_start >> BDRV_SECTOR_BITS) + 1, &sd->qiov, 1, sd_blk_read_completed_fn, sd);
+    if (end_sector >
+           (sd->data_start + sd->cur_rwvec->transferred) >> BDRV_SECTOR_BITS) {
+        memcpy(sd->data, sd->buf + offset, BDRV_SECTOR_SIZE - offset);
+        sd->cur_rwvec->transferred += BDRV_SECTOR_SIZE - offset;
+        bdrv_aio_readv(sd->bdrv, end_sector, &sd->qiov, 1,
+                sd_read_done_fn, sd);
         return;
     } else {
-        memcpy(sd->cur_rwvec->buf + sd->data_offset, sd->buf + offset, io_len - sd->data_offset);
+        memcpy(sd->data + sd->cur_rwvec->transferred, sd->buf + offset,
+                io_len - sd->cur_rwvec->transferred);
     }
 
-    sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque, io_len);
+    memcpy(sd->cur_rwvec->buf, sd->data, sd->cur_rwvec->len);
+    sd->data_offset += sd->cur_rwvec->len;
+    sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque);
+
+    if (sd->data_offset < io_len) {
+        return;
+    }
 
     switch (sd->current_cmd) {
     case 17:    /* CMD17:  READ_SINGLE_BLOCK */
@@ -1821,7 +1831,7 @@ static void sd_blk_read_next_fn(void *opaque, int ret)
     bdrv_aio_readv(sd->bdrv, (sd->data_start >> BDRV_SECTOR_BITS) + 1, &sd->qiov, 1, sd_blk_write_partial_fn, sd);
 }
 
-static void sd_blk_write_completed_fn(void *opaque, int ret)
+static void sd_write_done_fn(void *opaque, int ret)
 {
     SDState *sd = opaque;
 
@@ -1872,73 +1882,123 @@ static void sd_blk_write_partial_fn(void *opaque, int ret)
     offset = start & ~BDRV_SECTOR_MASK;
 
     if (end > ((start & BDRV_SECTOR_MASK) + BDRV_SECTOR_SIZE)) {
-        memcpy(sd->buf + offset, sd->cur_rwvec->buf + sd->data_offset, BDRV_SECTOR_SIZE - offset);
+        memcpy(sd->buf + offset, sd->cur_rwvec->buf + sd->data_offset,
+                BDRV_SECTOR_SIZE - offset);
         sd->data_offset += BDRV_SECTOR_SIZE - offset;
-        bdrv_aio_writev(sd->bdrv, sd->data_start >> BDRV_SECTOR_BITS, &sd->qiov, 1, sd_blk_read_next_fn, sd);
+        bdrv_aio_writev(sd->bdrv, sd->data_start >> BDRV_SECTOR_BITS,
+                &sd->qiov, 1, sd_blk_read_next_fn, sd);
     } else {
-        memcpy(sd->buf + offset, sd->cur_rwvec->buf + sd->data_offset, sd->blk_len - sd->data_offset);
-        bdrv_aio_writev(sd->bdrv, sd->data_start >> BDRV_SECTOR_BITS, &sd->qiov, 1, sd_blk_write_completed_fn, sd);
+        memcpy(sd->buf + offset, sd->cur_rwvec->buf + sd->data_offset,
+                sd->blk_len - sd->data_offset);
+        bdrv_aio_writev(sd->bdrv, sd->data_start >> BDRV_SECTOR_BITS,
+                &sd->qiov, 1, sd_write_done_fn, sd);
     }
 }
 
-void sd_read_data_block_async(SDState *sd, SDBlockRWVec *read_v)
+void sd_set_rw_vec(SDState *sd, SDBlockRWVec *rw_vec)
 {
-    if (!sd->bdrv || !bdrv_is_inserted(sd->bdrv) || !sd->enable) {
-        return;
-    }
+	sd->cur_rwvec = rw_vec;
+	sd->cur_rwvec->transferred = 0;
+}
 
-    if (sd->state != sd_sendingdata_state) {
-        DPRINTF("not in Sending-Data state\n");
-        return;
-    }
-
-    if (sd->card_status & (ADDRESS_ERROR | WP_VIOLATION)) {
-        return;
-    }
-
-    if (read_v) {
-        sd->cur_rwvec = read_v;
-    }
-
-    assert(sd->cur_rwvec);
+static void sd_read_data_async(SDState *sd)
+{
+    uint32_t io_len = (sd->ocr & (1 << 30)) ? 512 : sd->blk_len;
 
     switch (sd->current_cmd) {
     case 11:    /* CMD11:  READ_DAT_UNTIL_STOP */
-    case 17:    /* CMD17:  READ_SINGLE_BLOCK */
     case 18:    /* CMD18:  READ_MULTIPLE_BLOCK */
-        bdrv_aio_readv(sd->bdrv, sd->data_start >> BDRV_SECTOR_BITS, &sd->qiov, 1, sd_blk_read_completed_fn, sd);
+        if (sd->data_offset == 0) {
+            bdrv_aio_readv(sd->bdrv, sd->data_start >> BDRV_SECTOR_BITS,
+                    &sd->qiov, 1, sd_read_done_fn, sd);
+            break;
+        }
+
+        memcpy(sd->cur_rwvec->buf, &sd->data[sd->data_offset],
+                sd->cur_rwvec->len);
+        sd->data_offset += sd->cur_rwvec->len;
+        sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque);
+
+        if (sd->data_offset >= io_len) {
+            sd->data_start += io_len;
+            sd->data_offset = 0;
+            if (sd->data_start + io_len > sd->size) {
+                sd->card_status |= ADDRESS_ERROR;
+            }
+        }
+        break;
+    case 17:    /* CMD17:  READ_SINGLE_BLOCK */
+        if (sd->data_offset == 0) {
+            bdrv_aio_readv(sd->bdrv, sd->data_start >> BDRV_SECTOR_BITS,
+                    &sd->qiov, 1, sd_read_done_fn, sd);
+            break;
+        }
+
+        memcpy(sd->cur_rwvec->buf, &sd->data[sd->data_offset],
+                sd->cur_rwvec->len);
+        sd->data_offset += sd->cur_rwvec->len;
+        sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque);
+
+        if (sd->data_offset >= io_len) {
+            sd->state = sd_transfer_state;
+            sd->cur_rwvec = NULL;
+        }
         break;
     case 9: /* CMD9:   SEND_CSD */
     case 10:    /* CMD10:  SEND_CID */
-        memcpy(sd->cur_rwvec->buf, sd->data, 16);
-        sd->state = sd_transfer_state;
-        sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque, 16);
-        sd->cur_rwvec = NULL;
+        memcpy(sd->cur_rwvec->buf, &sd->data[sd->data_offset],
+                sd->cur_rwvec->len);
+        sd->data_offset += sd->cur_rwvec->len;
+        sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque);
+
+        if (sd->data_offset >= 16) {
+            sd->state = sd_transfer_state;
+            sd->cur_rwvec = NULL;
+        }
         break;
     case 13:    /* ACMD13: SD_STATUS */
-        memcpy(sd->cur_rwvec->buf, sd->sd_status, sizeof(sd->sd_status));
-        sd->state = sd_transfer_state;
-        sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque, sizeof(sd->sd_status));
-        sd->cur_rwvec = NULL;
+        memcpy(sd->cur_rwvec->buf, &sd->sd_status[sd->data_offset],
+                sd->cur_rwvec->len);
+        sd->data_offset += sd->cur_rwvec->len;
+        sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque);
+
+        if (sd->data_offset >= sizeof(sd->sd_status)) {
+            sd->state = sd_transfer_state;
+            sd->cur_rwvec = NULL;
+        }
         break;
     case 22:    /* ACMD22: SEND_NUM_WR_BLOCKS */
     case 30:    /* CMD30:  SEND_WRITE_PROT */
-        memcpy(sd->cur_rwvec->buf, sd->data, 4);
-        sd->state = sd_transfer_state;
-        sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque, 4);
-        sd->cur_rwvec = NULL;
+        memcpy(sd->cur_rwvec->buf, &sd->data[sd->data_offset],
+                sd->cur_rwvec->len);
+        sd->data_offset += sd->cur_rwvec->len;
+        sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque);
+
+        if (sd->data_offset >= 4) {
+            sd->state = sd_transfer_state;
+            sd->cur_rwvec = NULL;
+        }
         break;
     case 51:    /* ACMD51: SEND_SCR */
-        memcpy(sd->cur_rwvec->buf, sd->scr, sizeof(sd->scr));
-        sd->state = sd_transfer_state;
+        memcpy(sd->cur_rwvec->buf, &sd->scr[sd->data_offset],
+                sd->cur_rwvec->len);
+        sd->data_offset += sd->cur_rwvec->len;
         sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque, sizeof(sd->scr));
-        sd->cur_rwvec = NULL;
+
+        if (sd->data_offset >= sizeof(sd->scr)) {
+            sd->state = sd_transfer_state;
+            sd->cur_rwvec = NULL;
+        }
         break;
     case 56:    /* CMD56:  GEN_CMD */
-        memset(sd->cur_rwvec->buf, 0xec, sd->blk_len);
-        sd->state = sd_transfer_state;
+        memset(sd->cur_rwvec->buf, 0xec, sd->cur_rwvec->len);
+        sd->data_offset += sd->cur_rwvec->len;
         sd->cur_rwvec->cb_fn(sd->cur_rwvec->opaque, sd->blk_len);
-        sd->cur_rwvec = NULL;
+
+        if (sd->data_offset >= sd->blk_len) {
+            sd->state = sd_transfer_state;
+            sd->cur_rwvec = NULL;
+        }
         break;
     default:
         DPRINTF("unknown command\n");
@@ -1946,27 +2006,9 @@ void sd_read_data_block_async(SDState *sd, SDBlockRWVec *read_v)
     }
 }
 
-void sd_write_data_block_async(SDState *sd, SDBlockRWVec *write_v)
+static void sd_write_data_async(SDState *sd, SDBlockRWVec *write_v)
 {
     int i;
-
-    if (!sd->bdrv || !bdrv_is_inserted(sd->bdrv) || !sd->enable)
-        return;
-
-    if (sd->state != sd_receivingdata_state) {
-        DPRINTF("not in Receiving-Data state\n");
-        return;
-    }
-
-    if (sd->card_status & (ADDRESS_ERROR | WP_VIOLATION)) {
-        return;
-    }
-
-    if (write_v) {
-        sd->cur_rwvec = write_v;
-    }
-
-    assert(sd->cur_rwvec);
 
     switch (sd->current_cmd) {
     case 24:    /* CMD24:  WRITE_SINGLE_BLOCK */
@@ -1988,7 +2030,7 @@ void sd_write_data_block_async(SDState *sd, SDBlockRWVec *write_v)
         }
         /* TODO: Check CRC before committing */
         memcpy(sd->buf, sd->cur_rwvec->buf, sd->blk_len);
-        bdrv_aio_writev(sd->bdrv, sd->data_start >> BDRV_SECTOR_BITS, &sd->qiov, 1, sd_blk_write_completed_fn, sd);
+        bdrv_aio_writev(sd->bdrv, sd->data_start >> BDRV_SECTOR_BITS, &sd->qiov, 1, sd_write_done_fn, sd);
         break;
     case 26:    /* CMD26:  PROGRAM_CID */
         /* TODO: Check CRC before committing */
@@ -2053,6 +2095,42 @@ void sd_write_data_block_async(SDState *sd, SDBlockRWVec *write_v)
         break;
     default:
         DPRINTF("unknown command\n");
+        break;
+    }
+}
+
+void sd_start_data_transfer_async(SDState *sd)
+{
+    if (!sd->bdrv || !bdrv_is_inserted(sd->bdrv) || !sd->enable) {
+        return;
+    }
+
+    if (sd->card_status & (ADDRESS_ERROR | WP_VIOLATION)) {
+        return;
+    }
+
+    if (sd->cur_rwvec == NULL) {
+    	DPRINTF("Transfer wasn't setup properly\n");
+        assert(sd->cur_rwvec);
+    }
+
+    switch (sd->cur_rwvec->direction) {
+    case SD_READ_FROM_CARD:
+        if (sd->state != sd_sendingdata_state) {
+            DPRINTF("not in Sending-Data state\n");
+            break;
+        }
+        sd_read_data_async(sd);
+        break;
+    case SD_WRITE_TO_CARD:
+        if (sd->state != sd_receivingdata_state) {
+            DPRINTF("not in Receiving-Data state\n");
+            break;
+        }
+        sd_write_data_async(sd);
+        break;
+    default:
+        DPRINTF("Unknown transfer direction\n");
         break;
     }
 }

@@ -295,11 +295,9 @@ static void sdhci_end_transfer(SDHCIState *s)
  * Programmed i/o data transfer
  */
 
-static void sdhci_block_read_complete_fn(void *opaque, unsigned bytes_read)
+static void sdhci_block_read_complete_fn(void *opaque)
 {
     SDHCIState *s = opaque;
-
-    assert((s->blksize & 0x0fff) == bytes_read);
 
     /* New data now available for READ through Buffer Port Register */
     s->prnsts |= SDHC_DATA_AVAILABLE;
@@ -335,10 +333,13 @@ static void sdhci_read_block_from_card(SDHCIState *s)
     }
 
     s->rw_vec.buf = s->fifo_buffer;
+    s->rw_vec.len = s->blksize & 0x0fff;
+    s->rw_vec.direction = SD_READ_FROM_CARD;
     s->rw_vec.cb_fn = sdhci_block_read_complete_fn;
     s->rw_vec.opaque = s;
 
-    sd_read_data_block_async(s->card, &s->rw_vec);
+    sd_set_rw_vec(s->card, &s->rw_vec);
+    sd_start_data_transfer_async(s->card);
 }
 
 /* Read @size byte of data from host controller @s BUFFER DATA PORT register */
@@ -375,7 +376,7 @@ static uint32_t sdhci_read_dataport(SDHCIState *s, unsigned size)
                  !(s->prnsts & SDHC_DAT_LINE_ACTIVE))) {
                 SDHCI_GET_CLASS(s)->end_data_transfer(s);
             } else { /* if there are more data, read next block from card */
-                sd_read_data_block_async(s->card, NULL);
+                sd_start_data_transfer_async(s->card);
             }
             break;
         }
