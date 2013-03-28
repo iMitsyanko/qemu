@@ -385,16 +385,18 @@ static uint32_t sdhci_read_dataport(SDHCIState *s, unsigned size)
     return value;
 }
 
-static void sdhci_block_write_complete_fn(void *opaque, unsigned bytes_read)
+static void sdhci_block_write_complete_fn(void *opaque)
 {
     SDHCIState *s = opaque;
-
-    assert((s->blksize & 0x0fff) == bytes_read);
 
     /* Next data can be written through BUFFER DATORT register */
     s->prnsts |= SDHC_SPACE_AVAILABLE;
     if (s->norintstsen & SDHC_NISEN_WBUFRDY) {
         s->norintsts |= SDHC_NIS_WBUFRDY;
+    }
+
+    if (s->trnmod & SDHC_TRNS_BLK_CNT_EN) {
+        s->blkcnt--;
     }
 
     /* Finish transfer if that was the last block of data */
@@ -428,19 +430,18 @@ static void sdhci_write_block_to_card(SDHCIState *s)
         return;
     }
 
-    if (s->trnmod & SDHC_TRNS_BLK_CNT_EN) {
-        if (s->blkcnt == 0) {
-            return;
-        } else {
-            s->blkcnt--;
-        }
+    if ((s->trnmod & SDHC_TRNS_BLK_CNT_EN) && (s->blkcnt == 0)) {
+        return;
     }
 
     s->rw_vec.buf = s->fifo_buffer;
+    s->rw_vec.len = s->blksize & 0x0fff;
+    s->rw_vec.direction = SD_WRITE_TO_CARD;
     s->rw_vec.cb_fn = sdhci_block_write_complete_fn;
     s->rw_vec.opaque = s;
 
-    sd_write_data_block_async(s->card, &s->rw_vec);
+    sd_set_rw_vec(s->card, &s->rw_vec);
+    sd_start_data_transfer_async(s->card);
 }
 
 /* Write @size bytes of @value data to host controller @s Buffer Data Port
