@@ -549,5 +549,5 @@ PXA2xxMMCIState *pxa2xx_mmci_init(MemoryRegion *sysmem,
 void pxa2xx_mmci_handlers(PXA2xxMMCIState *s, qemu_irq readonly,
                 qemu_irq coverswitch)
 {
-    sd_set_cb(s->card, readonly, coverswitch);
+    sd_set_cb(s->card, readonly, coverswitch, NULL, NULL);
 }

@@ -65,10 +65,10 @@
 #define SDHC_CAPAB_30V            0ul        /* Voltage support 3.0v */
 #define SDHC_CAPAB_33V            1ul        /* Voltage support 3.3v */
 #define SDHC_CAPAB_SUSPRESUME     0ul        /* Suspend/resume support */
-#define SDHC_CAPAB_SDMA           0ul        /* SDMA support */
+#define SDHC_CAPAB_SDMA           1ul        /* SDMA support */
 #define SDHC_CAPAB_HIGHSPEED      1ul        /* High speed support */
-#define SDHC_CAPAB_ADMA1          0ul        /* ADMA1 support */
-#define SDHC_CAPAB_ADMA2          0ul        /* ADMA2 support */
+#define SDHC_CAPAB_ADMA1          1ul        /* ADMA1 support */
+#define SDHC_CAPAB_ADMA2          1ul        /* ADMA2 support */
 /* Maximum host controller R/W buffers size
  * Possible values: 512, 1024, 2048 bytes */
 #define SDHC_CAPAB_MAXBLOCKLENGTH 512ul
@@ -193,7 +193,7 @@ static void sdhci_reset(SDHCIState *s)
      * initialization */
     memset(&s->sdmasysad, 0, (uintptr_t)&s->capareg - (uintptr_t)&s->sdmasysad);
 
-    sd_set_cb(s->card, s->ro_cb, s->eject_cb);
+    sd_set_cb(s->card, s->ro_cb, s->eject_cb, NULL, NULL);
     s->data_count = 0;
     s->stopped_state = sdhc_not_stopped;
 }
@@ -295,9 +295,19 @@ static void sdhci_end_transfer(SDHCIState *s)
  * Programmed i/o data transfer
  */
 
-static void sdhci_block_read_complete_fn(void *opaque)
+/* Fill host controller's read buffer with BLKSIZE bytes of data from card */
+static void sdhci_read_block_from_card(SDHCIState *s)
 {
-    SDHCIState *s = opaque;
+    int index = 0;
+
+    if ((s->trnmod & SDHC_TRNS_MULTI) &&
+            (s->trnmod & SDHC_TRNS_BLK_CNT_EN) && (s->blkcnt == 0)) {
+        return;
+    }
+
+    for (index = 0; index < (s->blksize & 0x0fff); index++) {
+        s->fifo_buffer[index] = sd_read_data(s->card);
+    }
 
     /* New data now available for READ through Buffer Port Register */
     s->prnsts |= SDHC_DATA_AVAILABLE;
@@ -322,24 +332,6 @@ static void sdhci_block_read_complete_fn(void *opaque)
     }
 
     sdhci_update_irq(s);
-}
-
-/* Fill host controller's read buffer with BLKSIZE bytes of data from card */
-static void sdhci_read_block_from_card(SDHCIState *s)
-{
-    if ((s->trnmod & SDHC_TRNS_MULTI) &&
-            (s->trnmod & SDHC_TRNS_BLK_CNT_EN) && (s->blkcnt == 0)) {
-        return;
-    }
-
-    s->rw_vec.buf = s->fifo_buffer;
-    s->rw_vec.len = s->blksize & 0x0fff;
-    s->rw_vec.direction = SD_READ_FROM_CARD;
-    s->rw_vec.cb_fn = sdhci_block_read_complete_fn;
-    s->rw_vec.opaque = s;
-
-    sd_set_rw_vec(s->card, &s->rw_vec);
-    sd_start_data_transfer_async(s->card);
 }
 
 /* Read @size byte of data from host controller @s BUFFER DATA PORT register */
@@ -376,7 +368,7 @@ static uint32_t sdhci_read_dataport(SDHCIState *s, unsigned size)
                  !(s->prnsts & SDHC_DAT_LINE_ACTIVE))) {
                 SDHCI_GET_CLASS(s)->end_data_transfer(s);
             } else { /* if there are more data, read next block from card */
-                sd_start_data_transfer_async(s->card);
+                SDHCI_GET_CLASS(s)->read_block_from_card(s);
             }
             break;
         }
@@ -385,18 +377,35 @@ static uint32_t sdhci_read_dataport(SDHCIState *s, unsigned size)
     return value;
 }
 
-static void sdhci_block_write_complete_fn(void *opaque)
+/* Write data from host controller FIFO to card */
+static void sdhci_write_block_to_card(SDHCIState *s)
 {
-    SDHCIState *s = opaque;
+    int index = 0;
+
+    if (s->prnsts & SDHC_SPACE_AVAILABLE) {
+        if (s->norintstsen & SDHC_NISEN_WBUFRDY) {
+            s->norintsts |= SDHC_NIS_WBUFRDY;
+        }
+        sdhci_update_irq(s);
+        return;
+    }
+
+    if (s->trnmod & SDHC_TRNS_BLK_CNT_EN) {
+        if (s->blkcnt == 0) {
+            return;
+        } else {
+            s->blkcnt--;
+        }
+    }
+
+    for (index = 0; index < (s->blksize & 0x0fff); index++) {
+        sd_write_data(s->card, s->fifo_buffer[index]);
+    }
 
     /* Next data can be written through BUFFER DATORT register */
     s->prnsts |= SDHC_SPACE_AVAILABLE;
     if (s->norintstsen & SDHC_NISEN_WBUFRDY) {
         s->norintsts |= SDHC_NIS_WBUFRDY;
-    }
-
-    if (s->trnmod & SDHC_TRNS_BLK_CNT_EN) {
-        s->blkcnt--;
     }
 
     /* Finish transfer if that was the last block of data */
@@ -417,31 +426,6 @@ static void sdhci_block_write_complete_fn(void *opaque)
     }
 
     sdhci_update_irq(s);
-}
-
-/* Write data from host controller FIFO to card */
-static void sdhci_write_block_to_card(SDHCIState *s)
-{
-    if (s->prnsts & SDHC_SPACE_AVAILABLE) {
-        if (s->norintstsen & SDHC_NISEN_WBUFRDY) {
-            s->norintsts |= SDHC_NIS_WBUFRDY;
-        }
-        sdhci_update_irq(s);
-        return;
-    }
-
-    if ((s->trnmod & SDHC_TRNS_BLK_CNT_EN) && (s->blkcnt == 0)) {
-        return;
-    }
-
-    s->rw_vec.buf = s->fifo_buffer;
-    s->rw_vec.len = s->blksize & 0x0fff;
-    s->rw_vec.direction = SD_WRITE_TO_CARD;
-    s->rw_vec.cb_fn = sdhci_block_write_complete_fn;
-    s->rw_vec.opaque = s;
-
-    sd_set_rw_vec(s->card, &s->rw_vec);
-    sd_start_data_transfer_async(s->card);
 }
 
 /* Write @size bytes of @value data to host controller @s Buffer Data Port
@@ -850,13 +834,13 @@ static void sdhci_data_transfer(SDHCIState *s)
 
 static bool sdhci_can_issue_command(SDHCIState *s)
 {
-/*    if (!SDHC_CLOCK_IS_ON(s->clkcon) || !(s->pwrcon & SDHC_POWER_ON) ||
+    if (!SDHC_CLOCK_IS_ON(s->clkcon) || !(s->pwrcon & SDHC_POWER_ON) ||
         (((s->prnsts & SDHC_DATA_INHIBIT) || s->stopped_state) &&
         ((s->cmdreg & SDHC_CMD_DATA_PRESENT) ||
         ((s->cmdreg & SDHC_CMD_RESPONSE) == SDHC_CMD_RSP_WITH_BUSY &&
         !(SDHC_COMMAND_TYPE(s->cmdreg) == SDHC_CMD_ABORT))))) {
         return false;
-    }*/
+    }
 
     return true;
 }
@@ -1184,7 +1168,7 @@ static void sdhci_initfn(Object *obj)
     s->card = sd_init(di ? di->bdrv : NULL, 0);
     s->eject_cb = qemu_allocate_irqs(sdhci_insert_eject_cb, s, 1)[0];
     s->ro_cb = qemu_allocate_irqs(sdhci_card_readonly_cb, s, 1)[0];
-    sd_set_cb(s->card, s->ro_cb, s->eject_cb);
+    sd_set_cb(s->card, s->ro_cb, s->eject_cb, NULL, NULL);
 
     s->insert_timer = qemu_new_timer_ns(vm_clock, sdhci_raise_insertion_irq, s);
     s->transfer_timer = qemu_new_timer_ns(vm_clock, sdhci_do_data_transfer, s);

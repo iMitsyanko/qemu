@@ -15,12 +15,12 @@
 
 #ifdef DEBUG_PL181
 #define DPRINTF(fmt, ...) \
-do { printf("pl181: " fmt , ## __VA_ARGS__); } while (0)
+do { fprintf(stderr, "pl181: " fmt , ## __VA_ARGS__); } while (0)
 #else
 #define DPRINTF(fmt, ...) do {} while(0)
 #endif
 
-#define PL181_FIFO_LEN 16
+#define PL181_FIFO_LEN  64
 
 typedef struct {
     SysBusDevice busdev;
@@ -38,24 +38,24 @@ typedef struct {
     uint32_t datacnt;
     uint32_t status;
     uint32_t mask[2];
-    int32_t fifo_pos;
-    int32_t fifo_len;
+    uint32_t fifocnt;
     /* The linux 2.6.21 driver is buggy, and misbehaves if new data arrives
        while it is reading the FIFO.  We hack around this be defering
        subsequent transfers until after the driver polls the status word.
        http://www.arm.linux.org.uk/developer/patches/viewpatch.php?id=4446/1
      */
     int32_t linux_hack;
-    uint32_t fifo[PL181_FIFO_LEN];
     qemu_irq irq[2];
     /* GPIO outputs for 'card is readonly' and 'card inserted' */
     qemu_irq cardstatus[2];
+    qemu_irq sbit_received;
+    qemu_irq dat_busy;
 } pl181_state;
 
 static const VMStateDescription vmstate_pl181 = {
     .name = "pl181",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(clock, pl181_state),
         VMSTATE_UINT32(power, pl181_state),
@@ -69,10 +69,6 @@ static const VMStateDescription vmstate_pl181 = {
         VMSTATE_UINT32(datacnt, pl181_state),
         VMSTATE_UINT32(status, pl181_state),
         VMSTATE_UINT32_ARRAY(mask, pl181_state, 2),
-        VMSTATE_INT32(fifo_pos, pl181_state),
-        VMSTATE_INT32(fifo_len, pl181_state),
-        VMSTATE_INT32(linux_hack, pl181_state),
-        VMSTATE_UINT32_ARRAY(fifo, pl181_state, PL181_FIFO_LEN),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -125,6 +121,15 @@ static const VMStateDescription vmstate_pl181 = {
 static const unsigned char pl181_id[] =
 { 0x81, 0x11, 0x04, 0x00, 0x0d, 0xf0, 0x05, 0xb1 };
 
+static inline unsigned int pl181_get_blk_size(pl181_state *s)
+{
+    if (s->datactrl & PL181_DATA_MODE) {
+        return 1;
+    } else {
+        return 1 << ((s->datactrl >> 4) & 0xf);
+    }
+}
+
 static void pl181_update(pl181_state *s)
 {
     int i;
@@ -135,30 +140,99 @@ static void pl181_update(pl181_state *s)
 
 static void pl181_fifo_push(pl181_state *s, uint32_t value)
 {
-    int n;
+    unsigned i;
+    unsigned int blkdat_left = s->datacnt & (pl181_get_blk_size(s) - 1);
 
-    if (s->fifo_len == PL181_FIFO_LEN) {
-        fprintf(stderr, "pl181: FIFO overflow\n");
-        return;
+    if (blkdat_left == 0 && s->fifocnt == 0) {
+        /* Start of block */
+        blkdat_left = pl181_get_blk_size(s);
     }
-    n = (s->fifo_pos + s->fifo_len) & (PL181_FIFO_LEN - 1);
-    s->fifo_len++;
-    s->fifo[n] = value;
-    DPRINTF("FIFO push %08x\n", (int)value);
+
+    for (i = 0; i < sizeof(uint32_t); ++i) {
+        if (s->fifocnt >= PL181_FIFO_LEN) {
+            qemu_log_mask(LOG_GUEST_ERROR, "pl181_fifo_push: fifo overflow\n");
+            break;
+        }
+
+        sd_write_data_async(s->card, value >> i * 8);
+
+        if (blkdat_left > PL181_FIFO_LEN) {
+            --blkdat_left;
+            --s->datacnt;
+        } else {
+            ++s->fifocnt;
+        }
+    }
+
+    if (s->fifocnt == 0) {
+        s->status &= ~(PL181_STATUS_TXDATAAVLBL | PL181_STATUS_TXFIFOFULL);
+        s->status |= PL181_STATUS_TXFIFOEMPTY | PL181_STATUS_TXFIFOHALFEMPTY;
+    } else {
+        s->status &= ~(PL181_STATUS_TXFIFOEMPTY | PL181_STATUS_TXFIFOHALFEMPTY |
+            PL181_STATUS_TXFIFOFULL);
+        s->status |= PL181_STATUS_TXDATAAVLBL;
+
+        if (s->fifocnt == PL181_FIFO_LEN) {
+            s->status |= PL181_STATUS_TXFIFOFULL;
+        } else if (s->fifocnt <= (PL181_FIFO_LEN / 2)) {
+            s->status |= PL181_STATUS_TXFIFOHALFEMPTY;
+        }
+    }
+
+    DPRINTF("FIFO push %08x: datacnt=%u, fifocnt=%u\n",
+        (int)value, s->datacnt, s->fifocnt);
+    pl181_update(s);
 }
 
 static uint32_t pl181_fifo_pop(pl181_state *s)
 {
-    uint32_t value;
+    uint32_t value = 0;
+    uint32_t blksz_mask = pl181_get_blk_size(s) - 1;
+    unsigned i;
 
-    if (s->fifo_len == 0) {
-        fprintf(stderr, "pl181: FIFO underflow\n");
-        return 0;
+    for (i = 0; i < sizeof(uint32_t); ++i) {
+        if (s->fifocnt == 0) {
+            qemu_log_mask(LOG_GUEST_ERROR, "pl181_fifo_pop: fifo underflow\n");
+            break;
+        }
+
+        value |= sd_read_data_async(s->card) << i * 8;
+
+        if (s->datacnt & blksz_mask) {
+            --s->datacnt;
+        } else {
+            --s->fifocnt;
+        }
     }
-    value = s->fifo[s->fifo_pos];
-    s->fifo_len--;
-    s->fifo_pos = (s->fifo_pos + 1) & (PL181_FIFO_LEN - 1);
-    DPRINTF("FIFO pop %08x\n", (int)value);
+
+    if (s->fifocnt == 0) {
+        s->status |= PL181_STATUS_RXFIFOEMPTY | PL181_STATUS_DATABLOCKEND;
+        s->status &= ~(PL181_STATUS_RXDATAAVLBL | PL181_STATUS_RXFIFOFULL |
+            PL181_STATUS_RXFIFOHALFFULL);
+
+        if (s->datacnt == 0) {
+            s->status |= PL181_STATUS_DATAEND;
+            s->status &= ~PL181_STATUS_RX_FIFO;
+            s->datactrl &= ~PL181_DATA_ENABLE;
+            DPRINTF("Data engine idle\n");
+        }
+    } else {
+        s->status |= PL181_STATUS_RXDATAAVLBL;
+        s->status &= ~PL181_STATUS_RXFIFOEMPTY;
+
+        if (s->fifocnt == PL181_FIFO_LEN) {
+            s->status |= PL181_STATUS_RXFIFOFULL;
+        }
+
+        if (s->fifocnt >= (PL181_FIFO_LEN / 2)) {
+            s->status |= PL181_STATUS_RXFIFOHALFFULL;
+        }
+    }
+
+    pl181_update(s);
+
+    DPRINTF("FIFO pop %08x: datacnt=%u\n", (int)value, s->datacnt);
+
     return value;
 }
 
@@ -203,136 +277,157 @@ error:
     s->status |= PL181_STATUS_CMDTIMEOUT;
 }
 
-/* Transfer data between the card and the FIFO.  This is complicated by
-   the FIFO holding 32-bit words and the card taking data in single byte
-   chunks.  FIFO bytes are transferred in little-endian order.  */
-
-static void pl181_fifo_run(pl181_state *s)
+static void pl181_transfer_start(pl181_state *s)
 {
-    uint32_t bits;
-    uint32_t value = 0;
-    int n;
-    int is_read;
-
-    is_read = (s->datactrl & PL181_DATA_DIRECTION) != 0;
-    if (s->datacnt != 0 && (!is_read || sd_data_ready(s->card))
-            && !s->linux_hack) {
-        if (is_read) {
-            n = 0;
-            while (s->datacnt && s->fifo_len < PL181_FIFO_LEN) {
-                value |= (uint32_t)sd_read_data(s->card) << (n * 8);
-                s->datacnt--;
-                n++;
-                if (n == 4) {
-                    pl181_fifo_push(s, value);
-                    n = 0;
-                    value = 0;
-                }
-            }
-            if (n != 0) {
-                pl181_fifo_push(s, value);
-            }
-        } else { /* write */
-            n = 0;
-            while (s->datacnt > 0 && (s->fifo_len > 0 || n > 0)) {
-                if (n == 0) {
-                    value = pl181_fifo_pop(s);
-                    n = 4;
-                }
-                n--;
-                s->datacnt--;
-                sd_write_data(s->card, value & 0xff);
-                value >>= 8;
-            }
-        }
-    }
+    s->datacnt = s->datalength;
+    s->fifocnt = 0;
     s->status &= ~(PL181_STATUS_RX_FIFO | PL181_STATUS_TX_FIFO);
-    if (s->datacnt == 0) {
+
+    if (s->datacnt) {
+        if (s->datactrl & PL181_DATA_DIRECTION) {
+            s->status |= PL181_STATUS_RXFIFOEMPTY | PL181_STATUS_RXACTIVE;
+            DPRINTF("Reading %u bytes (blksz=%u): waiting for start bit\n",
+                s->datacnt, pl181_get_blk_size(s));
+        } else {
+            s->status |= PL181_STATUS_TXFIFOEMPTY |
+                PL181_STATUS_TXFIFOHALFEMPTY | PL181_STATUS_TXACTIVE;
+            DPRINTF("Writing %u bytes (blksize=%u)\n", s->datacnt,
+                pl181_get_blk_size(s));
+        }
+    } else {
         s->status |= PL181_STATUS_DATAEND;
-        /* HACK: */
-        s->status |= PL181_STATUS_DATABLOCKEND;
-        DPRINTF("Transfer Complete\n");
-    }
-    if (s->datacnt == 0 && s->fifo_len == 0) {
         s->datactrl &= ~PL181_DATA_ENABLE;
+    }
+
+    pl181_update(s);
+}
+
+static void pl181_start_bit_received(void *opaque, int irq, int level)
+{
+    pl181_state *s = (pl181_state *)opaque;
+    unsigned int blksz = pl181_get_blk_size(s);
+
+    if (!(s->status & PL181_STATUS_RXACTIVE) || s->datacnt == 0) {
+        qemu_log_mask(LOG_GUEST_ERROR, "pl181: unexpected start bit\n");
+        return;
+    }
+
+    if (s->linux_hack) {
+        s->linux_hack = 2;
+        return;
+    }
+
+    s->status &= ~(PL181_STATUS_RXFIFOHALFFULL | PL181_STATUS_RXFIFOFULL |
+        PL181_STATUS_RXFIFOEMPTY);
+    s->status |= PL181_STATUS_RXDATAAVLBL;
+    s->fifocnt = MIN(blksz, PL181_FIFO_LEN);
+    s->fifocnt = MIN(s->fifocnt, s->datacnt);
+    s->datacnt -= s->fifocnt;
+
+    if (s->fifocnt == PL181_FIFO_LEN) {
+        s->status |= PL181_STATUS_RXFIFOFULL;
+    }
+
+    if (s->fifocnt >= (PL181_FIFO_LEN / 2)) {
+        s->status |= PL181_STATUS_RXFIFOHALFFULL;
+    }
+
+    DPRINTF("Start bit received: datacnt=%u, fifocnt=%u\n",
+        s->datacnt, s->fifocnt);
+    pl181_update(s);
+}
+
+static void pl181_busy_deasserted(void *opaque, int irq, int level)
+{
+    pl181_state *s = (pl181_state *)opaque;
+
+    if (!(s->status & PL181_STATUS_TXACTIVE)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "pl181: unexpected busy end\n");
+        return;
+    }
+
+    s->datacnt -= s->fifocnt;
+    s->fifocnt = 0;
+
+    if (s->datacnt == 0) {
+        s->datactrl &= ~PL181_DATA_ENABLE;
+        s->status |= PL181_STATUS_DATAEND | PL181_STATUS_DATABLOCKEND;
+        s->status &= ~PL181_STATUS_TX_FIFO;
         DPRINTF("Data engine idle\n");
     } else {
-        /* Update FIFO bits.  */
-        bits = PL181_STATUS_TXACTIVE | PL181_STATUS_RXACTIVE;
-        if (s->fifo_len == 0) {
-            bits |= PL181_STATUS_TXFIFOEMPTY;
-            bits |= PL181_STATUS_RXFIFOEMPTY;
-        } else {
-            bits |= PL181_STATUS_TXDATAAVLBL;
-            bits |= PL181_STATUS_RXDATAAVLBL;
-        }
-        if (s->fifo_len == 16) {
-            bits |= PL181_STATUS_TXFIFOFULL;
-            bits |= PL181_STATUS_RXFIFOFULL;
-        }
-        if (s->fifo_len <= 8) {
-            bits |= PL181_STATUS_TXFIFOHALFEMPTY;
-        }
-        if (s->fifo_len >= 8) {
-            bits |= PL181_STATUS_RXFIFOHALFFULL;
-        }
-        if (s->datactrl & PL181_DATA_DIRECTION) {
-            bits &= PL181_STATUS_RX_FIFO;
-        } else {
-            bits &= PL181_STATUS_TX_FIFO;
-        }
-        s->status |= bits;
+        s->status &= ~PL181_STATUS_TXDATAAVLBL;
+        s->status |= PL181_STATUS_TXFIFOEMPTY | PL181_STATUS_TXFIFOHALFEMPTY |
+            PL181_STATUS_DATABLOCKEND;
     }
+
+    pl181_update(s);
+    DPRINTF("Busy deasserted: datacnt=%u\n", s->datacnt);
 }
 
 static uint64_t pl181_read(void *opaque, hwaddr offset,
                            unsigned size)
 {
     pl181_state *s = (pl181_state *)opaque;
-    uint32_t tmp;
+    uint32_t ret = 0;
+
 
     if (offset >= 0xfe0 && offset < 0x1000) {
         return pl181_id[(offset - 0xfe0) >> 2];
     }
     switch (offset) {
     case 0x00: /* Power */
-        return s->power;
+        ret = s->power;
+        break;
     case 0x04: /* Clock */
-        return s->clock;
+        ret = s->clock;
+        break;
     case 0x08: /* Argument */
-        return s->cmdarg;
+        ret = s->cmdarg;
+        break;
     case 0x0c: /* Command */
-        return s->cmd;
+        ret = s->cmd;
+        break;
     case 0x10: /* RespCmd */
-        return s->respcmd;
+        ret = s->respcmd;
+        break;
     case 0x14: /* Response0 */
-        return s->response[0];
+        ret = s->response[0];
+        break;
     case 0x18: /* Response1 */
-        return s->response[1];
+        ret = s->response[1];
+        break;
     case 0x1c: /* Response2 */
-        return s->response[2];
+        ret = s->response[2];
+        break;
     case 0x20: /* Response3 */
-        return s->response[3];
+        ret = s->response[3];
+        break;
     case 0x24: /* DataTimer */
-        return s->datatimer;
+        ret = s->datatimer;
+        break;
     case 0x28: /* DataLength */
-        return s->datalength;
+        ret = s->datalength;
+        break;
     case 0x2c: /* DataCtrl */
-        return s->datactrl;
+        ret = s->datactrl;
+        break;
     case 0x30: /* DataCnt */
-        return s->datacnt;
+        ret = s->datacnt;
+        break;
     case 0x34: /* Status */
-        tmp = s->status;
-        if (s->linux_hack) {
+        ret = s->status;
+        if (s->linux_hack == 2) {
             s->linux_hack = 0;
-            pl181_fifo_run(s);
-            pl181_update(s);
+            qemu_irq_raise(s->sbit_received);
         }
-        return tmp;
+        s->linux_hack = 0;
+        break;
     case 0x3c: /* Mask0 */
-        return s->mask[0];
+        ret = s->mask[0];
+        break;
     case 0x40: /* Mask1 */
-        return s->mask[1];
+        ret = s->mask[1];
+        break;
     case 0x48: /* FifoCnt */
         /* The documentation is somewhat vague about exactly what FifoCnt
            does.  On real hardware it appears to be when decrememnted
@@ -340,39 +435,41 @@ static uint64_t pl181_read(void *opaque, hwaddr offset,
            data engine.  DataCnt is decremented after each byte is
            transferred between the serial engine and the card.
            We don't emulate this level of detail, so both can be the same.  */
-        tmp = (s->datacnt + 3) >> 2;
-        if (s->linux_hack) {
+        ret = (s->datacnt + 3) >> 2;
+        if (s->linux_hack == 2) {
             s->linux_hack = 0;
-            pl181_fifo_run(s);
-            pl181_update(s);
+            qemu_irq_raise(s->sbit_received);
         }
-        return tmp;
+        s->linux_hack = 0;
+        break;
     case 0x80: case 0x84: case 0x88: case 0x8c: /* FifoData */
     case 0x90: case 0x94: case 0x98: case 0x9c:
     case 0xa0: case 0xa4: case 0xa8: case 0xac:
     case 0xb0: case 0xb4: case 0xb8: case 0xbc:
-        if (s->fifo_len == 0) {
+        if (s->fifocnt == 0) {
             qemu_log_mask(LOG_GUEST_ERROR, "pl181: Unexpected FIFO read\n");
-            return 0;
+            ret = 0;
         } else {
-            uint32_t value;
-            value = pl181_fifo_pop(s);
             s->linux_hack = 1;
-            pl181_fifo_run(s);
-            pl181_update(s);
-            return value;
+            ret = pl181_fifo_pop(s);
         }
+        break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "pl181_read: Bad offset %x\n", (int)offset);
-        return 0;
+        ret = 0;
+        break;
     }
+    DPRINTF("read 0x%" HWADDR_PRIx" --> 0x%x(%u)\n", offset, ret, ret);
+    return ret;
 }
 
 static void pl181_write(void *opaque, hwaddr offset,
                         uint64_t value, unsigned size)
 {
     pl181_state *s = (pl181_state *)opaque;
+    DPRINTF("write 0x%" HWADDR_PRIx" <-- 0x%x(%u)\n", offset,
+        (uint32_t)value, (uint32_t)value);
 
     switch (offset) {
     case 0x00: /* Power */
@@ -395,7 +492,6 @@ static void pl181_write(void *opaque, hwaddr offset,
                               "pl181: Pending commands not implemented\n");
             } else {
                 pl181_send_command(s);
-                pl181_fifo_run(s);
             }
             /* The command has completed one way or the other.  */
             s->cmd &= ~PL181_CMD_ENABLE;
@@ -410,8 +506,7 @@ static void pl181_write(void *opaque, hwaddr offset,
     case 0x2c: /* DataCtrl */
         s->datactrl = value & 0xff;
         if (value & PL181_DATA_ENABLE) {
-            s->datacnt = s->datalength;
-            pl181_fifo_run(s);
+            pl181_transfer_start(s);
         }
         break;
     case 0x38: /* Clear */
@@ -431,7 +526,6 @@ static void pl181_write(void *opaque, hwaddr offset,
             qemu_log_mask(LOG_GUEST_ERROR, "pl181: Unexpected FIFO write\n");
         } else {
             pl181_fifo_push(s, value);
-            pl181_fifo_run(s);
         }
         break;
     default:
@@ -469,9 +563,11 @@ static void pl181_reset(DeviceState *d)
     s->linux_hack = 0;
     s->mask[0] = 0;
     s->mask[1] = 0;
+    s->fifocnt = 0;
 
     /* We can assume our GPIO outputs have been wired up now */
-    sd_set_cb(s->card, s->cardstatus[0], s->cardstatus[1]);
+    sd_set_cb(s->card, s->cardstatus[0], s->cardstatus[1], s->sbit_received,
+        s->dat_busy);
 }
 
 static int pl181_init(SysBusDevice *dev)
@@ -486,6 +582,9 @@ static int pl181_init(SysBusDevice *dev)
     qdev_init_gpio_out(&s->busdev.qdev, s->cardstatus, 2);
     dinfo = drive_get_next(IF_SD);
     s->card = sd_init(dinfo ? dinfo->bdrv : NULL, 0);
+    s->sbit_received = qemu_allocate_irqs(pl181_start_bit_received, s, 1)[0];
+    s->dat_busy = qemu_allocate_irqs(pl181_busy_deasserted, s, 1)[0];
+
     return 0;
 }
 
