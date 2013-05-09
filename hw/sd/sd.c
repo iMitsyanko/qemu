@@ -116,6 +116,7 @@ struct SDState {
     QEMUIOVector qiov;
     struct iovec iov;
     BlockDriverAIOCB *aiocb;
+    uint32_t transf_cnt;
 };
 
 static void sd_set_mode(SDState *sd)
