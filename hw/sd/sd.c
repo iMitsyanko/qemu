@@ -685,6 +685,44 @@ static void sd_lock_command(SDState *sd)
         sd->card_status &= ~CARD_IS_LOCKED;
 }
 
+static void sd_bdrv_read_done(void *opaque, int ret)
+{
+    SDState *sd = opaque;
+    uint32_t io_len, offset;
+    uint64_t end_sector;
+
+    DPRINTF("sd_bdrv_read_done ret = %d, \n", ret);
+    sd->aiocb = NULL;
+
+    if (ret != 0) {
+        return;
+    }
+
+    if (sd->state != sd_sendingdata_state) {
+        DPRINTF("Transfer was aborted\n");
+        return;
+    }
+
+    io_len = (sd->ocr & (1 << 30)) ? 512 : sd->blk_len;
+    end_sector = (sd->data_start + io_len - 1) >> BDRV_SECTOR_BITS;
+    offset = (sd->data_start + sd->transf_cnt) & ~BDRV_SECTOR_MASK;
+
+    if (end_sector >
+           (sd->data_start + sd->transf_cnt) >> BDRV_SECTOR_BITS) {
+        memcpy(sd->data, sd->buf + offset, BDRV_SECTOR_SIZE - offset);
+        sd->transf_cnt += BDRV_SECTOR_SIZE - offset;
+        sd->aiocb = bdrv_aio_readv(sd->bdrv, end_sector, &sd->qiov, 1,
+                sd_bdrv_read_done, sd);
+        return;
+    } else {
+        memcpy(sd->data + sd->transf_cnt, sd->buf + offset,
+                io_len - sd->transf_cnt);
+        sd->transf_cnt += io_len - sd->transf_cnt;
+    }
+
+    qemu_irq_raise(sd->start_bit_cb);
+}
+
 static sd_rsp_type_t sd_normal_command(SDState *sd,
                                        SDRequest req)
 {
@@ -891,8 +929,13 @@ static sd_rsp_type_t sd_normal_command(SDState *sd,
             sd->data_start = req.arg;
             sd->data_offset = 0;
 
-            if (sd->data_start + sd->blk_len > sd->size)
+            if (sd->data_start + sd->blk_len > sd->size) {
                 sd->card_status |= ADDRESS_ERROR;
+            } else if (sd->iov.iov_base) {
+                sd->aiocb = bdrv_aio_readv(sd->bdrv,
+                                           sd->data_start >> BDRV_SECTOR_BITS,
+                                           &sd->qiov, 1, sd_bdrv_read_done, sd);
+            }
             return sd_r0;
 
         default:
@@ -904,6 +947,10 @@ static sd_rsp_type_t sd_normal_command(SDState *sd,
         switch (sd->state) {
         case sd_sendingdata_state:
             sd->state = sd_transfer_state;
+            if (sd->aiocb) {
+                bdrv_aio_cancel(sd->aiocb);
+                sd->aiocb = NULL;
+            }
             return sd_r1b;
 
         case sd_receivingdata_state:
@@ -969,8 +1016,13 @@ static sd_rsp_type_t sd_normal_command(SDState *sd,
             sd->data_start = addr;
             sd->data_offset = 0;
 
-            if (sd->data_start + sd->blk_len > sd->size)
+            if (sd->data_start + sd->blk_len > sd->size) {
                 sd->card_status |= ADDRESS_ERROR;
+            } else {
+                sd->aiocb = bdrv_aio_readv(sd->bdrv,
+                                           sd->data_start >> BDRV_SECTOR_BITS,
+                                           &sd->qiov, 1, sd_bdrv_read_done, sd);
+            }
             return sd_r1;
 
         default:
@@ -985,8 +1037,13 @@ static sd_rsp_type_t sd_normal_command(SDState *sd,
             sd->data_start = addr;
             sd->data_offset = 0;
 
-            if (sd->data_start + sd->blk_len > sd->size)
+            if (sd->data_start + sd->blk_len > sd->size) {
                 sd->card_status |= ADDRESS_ERROR;
+            } else {
+                sd->aiocb = bdrv_aio_readv(sd->bdrv,
+                                           sd->data_start >> BDRV_SECTOR_BITS,
+                                           &sd->qiov, 1, sd_bdrv_read_done, sd);
+            }
             return sd_r1;
 
         default:
@@ -1706,16 +1763,21 @@ uint8_t sd_read_data(SDState *sd)
         break;
 
     case 11:	/* CMD11:  READ_DAT_UNTIL_STOP */
-        if (sd->data_offset == 0)
+        if (sd->data_offset == 0 && sd->iov.iov_base == NULL) {
             BLK_READ_BLOCK(sd->data_start, io_len);
+        }
         ret = sd->data[sd->data_offset ++];
 
         if (sd->data_offset >= io_len) {
             sd->data_start += io_len;
             sd->data_offset = 0;
+            sd->transf_cnt = 0;
             if (sd->data_start + io_len > sd->size) {
                 sd->card_status |= ADDRESS_ERROR;
-                break;
+            } else if (sd->iov.iov_base) {
+                sd->aiocb = bdrv_aio_readv(sd->bdrv,
+                                           sd->data_start >> BDRV_SECTOR_BITS,
+                                           &sd->qiov, 1, sd_bdrv_read_done, sd);
             }
         }
         break;
@@ -1728,8 +1790,9 @@ uint8_t sd_read_data(SDState *sd)
         break;
 
     case 17:	/* CMD17:  READ_SINGLE_BLOCK */
-        if (sd->data_offset == 0)
+        if (sd->data_offset == 0 && sd->iov.iov_base == NULL) {
             BLK_READ_BLOCK(sd->data_start, io_len);
+        }
         ret = sd->data[sd->data_offset ++];
 
         if (sd->data_offset >= io_len)
@@ -1737,8 +1800,9 @@ uint8_t sd_read_data(SDState *sd)
         break;
 
     case 18:	/* CMD18:  READ_MULTIPLE_BLOCK */
-        if (sd->data_offset == 0)
+        if (sd->data_offset == 0 && sd->iov.iov_base == NULL) {
             BLK_READ_BLOCK(sd->data_start, io_len);
+        }
         ret = sd->data[sd->data_offset ++];
 
         if (sd->data_offset >= io_len) {
@@ -1746,7 +1810,10 @@ uint8_t sd_read_data(SDState *sd)
             sd->data_offset = 0;
             if (sd->data_start + io_len > sd->size) {
                 sd->card_status |= ADDRESS_ERROR;
-                break;
+            } else if (sd->iov.iov_base) {
+                sd->aiocb = bdrv_aio_readv(sd->bdrv,
+                                           sd->data_start >> BDRV_SECTOR_BITS,
+                                           &sd->qiov, 1, sd_bdrv_read_done, sd);
             }
         }
         break;
