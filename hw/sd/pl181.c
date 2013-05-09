@@ -471,7 +471,7 @@ static void pl181_reset(DeviceState *d)
     s->mask[1] = 0;
 
     /* We can assume our GPIO outputs have been wired up now */
-    sd_set_cb(s->card, s->cardstatus[0], s->cardstatus[1]);
+    sd_set_cb(s->card, s->cardstatus[0], s->cardstatus[1], NULL, NULL);
 }
 
 static int pl181_init(SysBusDevice *dev)

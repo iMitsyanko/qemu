@@ -620,7 +620,7 @@ struct omap_mmc_s *omap2_mmc_init(struct omap_target_agent_s *ta,
     s->card = sd_init(bd, 0);
 
     s->cdet = qemu_allocate_irqs(omap_mmc_cover_cb, s, 1)[0];
-    sd_set_cb(s->card, NULL, s->cdet);
+    sd_set_cb(s->card, NULL, s->cdet, NULL, NULL);
 
     return s;
 }
@@ -628,11 +628,11 @@ struct omap_mmc_s *omap2_mmc_init(struct omap_target_agent_s *ta,
 void omap_mmc_handlers(struct omap_mmc_s *s, qemu_irq ro, qemu_irq cover)
 {
     if (s->cdet) {
-        sd_set_cb(s->card, ro, s->cdet);
+        sd_set_cb(s->card, ro, s->cdet, NULL, NULL);
         s->coverswitch = cover;
         qemu_set_irq(cover, s->cdet_state);
     } else
-        sd_set_cb(s->card, ro, cover);
+        sd_set_cb(s->card, ro, cover, NULL, NULL);
 }
 
 void omap_mmc_enable(struct omap_mmc_s *s, int enable)

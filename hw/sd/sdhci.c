@@ -193,7 +193,7 @@ static void sdhci_reset(SDHCIState *s)
      * initialization */
     memset(&s->sdmasysad, 0, (uintptr_t)&s->capareg - (uintptr_t)&s->sdmasysad);
 
-    sd_set_cb(s->card, s->ro_cb, s->eject_cb);
+    sd_set_cb(s->card, s->ro_cb, s->eject_cb, NULL, NULL);
     s->data_count = 0;
     s->stopped_state = sdhc_not_stopped;
 }
@@ -1168,7 +1168,7 @@ static void sdhci_initfn(Object *obj)
     s->card = sd_init(di ? di->bdrv : NULL, 0);
     s->eject_cb = qemu_allocate_irqs(sdhci_insert_eject_cb, s, 1)[0];
     s->ro_cb = qemu_allocate_irqs(sdhci_card_readonly_cb, s, 1)[0];
-    sd_set_cb(s->card, s->ro_cb, s->eject_cb);
+    sd_set_cb(s->card, s->ro_cb, s->eject_cb, NULL, NULL);
 
     s->insert_timer = qemu_new_timer_ns(vm_clock, sdhci_raise_insertion_irq, s);
     s->transfer_timer = qemu_new_timer_ns(vm_clock, sdhci_do_data_transfer, s);

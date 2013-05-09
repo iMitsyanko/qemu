@@ -108,6 +108,8 @@ struct SDState {
     uint8_t data[512];
     qemu_irq readonly_cb;
     qemu_irq inserted_cb;
+    qemu_irq start_bit_cb;
+    qemu_irq datbusy_cb;
     BlockDriverState *bdrv;
     uint8_t *buf;
 
@@ -519,10 +521,13 @@ SDState *sd_init(BlockDriverState *bs, bool is_spi)
     return sd;
 }
 
-void sd_set_cb(SDState *sd, qemu_irq readonly, qemu_irq insert)
+void sd_set_cb(SDState *sd, qemu_irq readonly, qemu_irq insert,
+               qemu_irq startbit, qemu_irq endbusy)
 {
     sd->readonly_cb = readonly;
     sd->inserted_cb = insert;
+    sd->start_bit_cb = startbit;
+    sd->datbusy_cb = endbusy;
     qemu_set_irq(readonly, sd->bdrv ? bdrv_is_read_only(sd->bdrv) : 0);
     qemu_set_irq(insert, sd->bdrv ? bdrv_is_inserted(sd->bdrv) : 0);
 }
@@ -762,6 +767,7 @@ static sd_rsp_type_t sd_normal_command(SDState *sd,
             sd->state = sd_sendingdata_state;
             sd->data_start = 0;
             sd->data_offset = 0;
+            qemu_irq_raise(sd->start_bit_cb);
             return sd_r1;
 
         default:
@@ -841,6 +847,7 @@ static sd_rsp_type_t sd_normal_command(SDState *sd,
             memcpy(sd->data, sd->csd, 16);
             sd->data_start = addr;
             sd->data_offset = 0;
+            qemu_irq_raise(sd->start_bit_cb);
             return sd_r1;
 
         default:
@@ -863,6 +870,7 @@ static sd_rsp_type_t sd_normal_command(SDState *sd,
             memcpy(sd->data, sd->cid, 16);
             sd->data_start = addr;
             sd->data_offset = 0;
+            qemu_irq_raise(sd->start_bit_cb);
             return sd_r1;
 
         default:
@@ -1111,6 +1119,7 @@ static sd_rsp_type_t sd_normal_command(SDState *sd,
             *(uint32_t *) sd->data = sd_wpbits(sd, req.arg);
             sd->data_start = addr;
             sd->data_offset = 0;
+            qemu_irq_raise(sd->start_bit_cb);
             return sd_r1b;
 
         default:
@@ -1201,10 +1210,12 @@ static sd_rsp_type_t sd_normal_command(SDState *sd,
         switch (sd->state) {
         case sd_transfer_state:
             sd->data_offset = 0;
-            if (req.arg & 1)
+            if (req.arg & 1) {
                 sd->state = sd_sendingdata_state;
-            else
+                qemu_irq_raise(sd->start_bit_cb);
+            } else {
                 sd->state = sd_receivingdata_state;
+            }
             return sd_r1;
 
         default:
@@ -1251,6 +1262,7 @@ static sd_rsp_type_t sd_app_command(SDState *sd,
             sd->state = sd_sendingdata_state;
             sd->data_start = 0;
             sd->data_offset = 0;
+            qemu_irq_raise(sd->start_bit_cb);
             return sd_r1;
 
         default:
@@ -1266,6 +1278,7 @@ static sd_rsp_type_t sd_app_command(SDState *sd,
             sd->state = sd_sendingdata_state;
             sd->data_start = 0;
             sd->data_offset = 0;
+            qemu_irq_raise(sd->start_bit_cb);
             return sd_r1;
 
         default:
@@ -1319,6 +1332,7 @@ static sd_rsp_type_t sd_app_command(SDState *sd,
             sd->state = sd_sendingdata_state;
             sd->data_start = 0;
             sd->data_offset = 0;
+            qemu_irq_raise(sd->start_bit_cb);
             return sd_r1;
 
         default:
@@ -1596,6 +1610,7 @@ void sd_write_data(SDState *sd, uint8_t value)
                 }
             /* Bzzzzzzztt .... Operation complete.  */
             sd->state = sd_transfer_state;
+            qemu_irq_raise(sd->datbusy_cb);
         }
         break;
 
@@ -1620,6 +1635,7 @@ void sd_write_data(SDState *sd, uint8_t value)
                 }
             /* Bzzzzzzztt .... Operation complete.  */
             sd->state = sd_transfer_state;
+            qemu_irq_raise(sd->datbusy_cb);
         }
         break;
 
@@ -1631,6 +1647,7 @@ void sd_write_data(SDState *sd, uint8_t value)
             sd_lock_command(sd);
             /* Bzzzzzzztt .... Operation complete.  */
             sd->state = sd_transfer_state;
+            qemu_irq_raise(sd->datbusy_cb);
         }
         break;
 
@@ -1639,6 +1656,7 @@ void sd_write_data(SDState *sd, uint8_t value)
         if (sd->data_offset >= sd->blk_len) {
             APP_WRITE_BLOCK(sd->data_start, sd->data_offset);
             sd->state = sd_transfer_state;
+            qemu_irq_raise(sd->datbusy_cb);
         }
         break;
 
