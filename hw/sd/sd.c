@@ -112,6 +112,10 @@ struct SDState {
     uint8_t *buf;
 
     bool enable;
+
+    QEMUIOVector qiov;
+    struct iovec iov;
+    BlockDriverAIOCB *aiocb;
 };
 
 static void sd_set_mode(SDState *sd)
@@ -403,6 +407,11 @@ static void sd_reset(SDState *sd, BlockDriverState *bdrv)
     uint64_t size;
     uint64_t sect;
 
+    if (sd->aiocb) {
+        bdrv_aio_cancel(sd->aiocb);
+        sd->aiocb = NULL;
+    }
+
     if (bdrv) {
         bdrv_get_geometry(bdrv, &sect);
     } else {
@@ -496,11 +505,15 @@ SDState *sd_init(BlockDriverState *bs, bool is_spi)
     sd->buf = qemu_blockalign(bs, 512);
     sd->spi = is_spi;
     sd->enable = true;
+    sd->aiocb = NULL;
+    sd->iov.iov_base = NULL;
+    sd->iov.iov_len = BDRV_SECTOR_SIZE;
     sd_reset(sd, bs);
     if (sd->bdrv) {
         bdrv_attach_dev_nofail(sd->bdrv, sd);
         bdrv_set_dev_ops(sd->bdrv, &sd_block_ops, sd);
     }
+    qemu_iovec_init_external(&sd->qiov, &sd->iov, 1);
     vmstate_register(NULL, -1, &sd_vmstate, sd);
     return sd;
 }
