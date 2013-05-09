@@ -957,6 +957,10 @@ static sd_rsp_type_t sd_normal_command(SDState *sd,
             sd->state = sd_programming_state;
             /* Bzzzzzzztt .... Operation complete.  */
             sd->state = sd_transfer_state;
+            if (sd->aiocb) {
+                bdrv_aio_cancel(sd->aiocb);
+                sd->aiocb = NULL;
+            }
             return sd_r1b;
 
         default:
@@ -1599,6 +1603,90 @@ static void sd_blk_write(SDState *sd, uint64_t addr, uint32_t len)
 #define APP_READ_BLOCK(a, len)	memset(sd->data, 0xec, len)
 #define APP_WRITE_BLOCK(a, len)
 
+static void sd_write_done(void *opaque, int ret)
+{
+    SDState *sd = opaque;
+
+    DPRINTF("sd_write_done: ret = %d\n", ret);
+    sd->aiocb = NULL;
+
+    if (ret != 0) {
+        return;
+    }
+
+    switch (sd->current_cmd) {
+    case 24:    /* CMD24:  WRITE_SINGLE_BLOCK */
+        sd->blk_written++;
+        sd->csd[14] |= 0x40;
+        /* Bzzzzzzztt .... Operation complete.  */
+        sd->state = sd_transfer_state;
+        qemu_irq_raise(sd->datbusy_cb);
+        break;
+    case 25:    /* CMD25:  WRITE_MULTIPLE_BLOCK */
+        sd->blk_written++;
+        sd->data_start += sd->blk_len;
+        sd->data_offset = 0;
+        sd->transf_cnt = 0;
+        sd->csd[14] |= 0x40;
+        /* Bzzzzzzztt .... Operation complete.  */
+        sd->state = sd_receivingdata_state;
+        qemu_irq_raise(sd->datbusy_cb);
+        break;
+    default:
+        DPRINTF("unknown command\n");
+        break;
+    }
+}
+
+static void sd_read_next_sector(void *opaque, int ret);
+
+static void sd_sector_read_done(void *opaque, int ret)
+{
+    SDState *sd = opaque;
+    uint64_t end;
+    unsigned offset, start;
+
+    DPRINTF("sd_sector_read_done ret = %d\n", ret);
+    sd->aiocb = NULL;
+
+    if (ret != 0) {
+        return;
+    }
+
+    start = sd->data_start + sd->transf_cnt;
+    end = sd->data_start + sd->blk_len;
+    offset = start & ~BDRV_SECTOR_MASK;
+
+    if (end > ((start & BDRV_SECTOR_MASK) + BDRV_SECTOR_SIZE)) {
+        memcpy(sd->buf + offset, sd->data, BDRV_SECTOR_SIZE - offset);
+        sd->transf_cnt += BDRV_SECTOR_SIZE - offset;
+        sd->aiocb = bdrv_aio_writev(sd->bdrv, start >> BDRV_SECTOR_BITS,
+                                    &sd->qiov, 1, sd_read_next_sector, sd);
+    } else {
+        memcpy(sd->buf + offset, sd->data + sd->transf_cnt,
+            sd->blk_len - sd->transf_cnt);
+        sd->transf_cnt += sd->blk_len - sd->transf_cnt;
+        sd->aiocb = bdrv_aio_writev(sd->bdrv, start >> BDRV_SECTOR_BITS,
+                                    &sd->qiov, 1, sd_write_done, sd);
+    }
+}
+
+static void sd_read_next_sector(void *opaque, int ret)
+{
+    SDState *sd = opaque;
+
+    DPRINTF("sd_read_next_sector ret = %d\n", ret);
+    sd->aiocb = NULL;
+
+    if (ret != 0) {
+        return;
+    }
+
+    sd->aiocb = bdrv_aio_readv(sd->bdrv,
+                               (sd->data_start >> BDRV_SECTOR_BITS) + 1,
+                               &sd->qiov, 1, sd_sector_read_done, sd);
+}
+
 void sd_write_data(SDState *sd, uint8_t value)
 {
     int i;
@@ -1620,11 +1708,27 @@ void sd_write_data(SDState *sd, uint8_t value)
         if (sd->data_offset >= sd->blk_len) {
             /* TODO: Check CRC before committing */
             sd->state = sd_programming_state;
-            BLK_WRITE_BLOCK(sd->data_start, sd->data_offset);
-            sd->blk_written ++;
-            sd->csd[14] |= 0x40;
-            /* Bzzzzzzztt .... Operation complete.  */
-            sd->state = sd_transfer_state;
+
+            if (sd->iov.iov_base) {
+                if ((sd->data_start & ~BDRV_SECTOR_MASK) ||
+                    sd->blk_len < BDRV_SECTOR_SIZE) {
+                    sd->aiocb = bdrv_aio_readv(sd->bdrv,
+                                   sd->data_start >> BDRV_SECTOR_BITS,
+                                   &sd->qiov, 1, sd_sector_read_done, sd);
+                    break;
+                }
+
+                memcpy(sd->buf, sd->data, sd->blk_len);
+                sd->aiocb = bdrv_aio_writev(sd->bdrv,
+                                            sd->data_start >> BDRV_SECTOR_BITS,
+                                            &sd->qiov, 1, sd_write_done, sd);
+            } else {
+                BLK_WRITE_BLOCK(sd->data_start, sd->data_offset);
+                sd->blk_written ++;
+                sd->csd[14] |= 0x40;
+                /* Bzzzzzzztt .... Operation complete.  */
+                sd->state = sd_transfer_state;
+            }
         }
         break;
 
@@ -1644,14 +1748,30 @@ void sd_write_data(SDState *sd, uint8_t value)
         if (sd->data_offset >= sd->blk_len) {
             /* TODO: Check CRC before committing */
             sd->state = sd_programming_state;
-            BLK_WRITE_BLOCK(sd->data_start, sd->data_offset);
-            sd->blk_written++;
-            sd->data_start += sd->blk_len;
-            sd->data_offset = 0;
-            sd->csd[14] |= 0x40;
 
-            /* Bzzzzzzztt .... Operation complete.  */
-            sd->state = sd_receivingdata_state;
+            if (sd->iov.iov_base) {
+                if ((sd->data_start & ~BDRV_SECTOR_MASK) ||
+                    sd->blk_len < BDRV_SECTOR_SIZE) {
+                    sd->aiocb = bdrv_aio_readv(sd->bdrv,
+                                   sd->data_start >> BDRV_SECTOR_BITS,
+                                   &sd->qiov, 1, sd_sector_read_done, sd);
+                    break;
+                }
+
+                memcpy(sd->buf, sd->data, sd->blk_len);
+                sd->aiocb = bdrv_aio_writev(sd->bdrv,
+                                            sd->data_start >> BDRV_SECTOR_BITS,
+                                            &sd->qiov, 1, sd_write_done, sd);
+            } else {
+                BLK_WRITE_BLOCK(sd->data_start, sd->data_offset);
+                sd->blk_written++;
+                sd->data_start += sd->blk_len;
+                sd->data_offset = 0;
+                sd->csd[14] |= 0x40;
+
+                /* Bzzzzzzztt .... Operation complete.  */
+                sd->state = sd_receivingdata_state;
+            }
         }
         break;
 
